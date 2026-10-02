@@ -1,14 +1,10 @@
 #!/usr/local/bin/python3.11
-"""Type local Phonon-2 dictation into the focused app while you speak.
+"""Record a clip, transcribe it once, and paste the text.
 
 The microphone stays closed until you double-tap Option. Double-tap Option
-again, or press Escape, to stop. Ctrl-C quits.
-
-A short pause stays in the same phrase. Words appear after the guess has
-settled, a little behind your voice, and a pause of about a second and a
-half locks the phrase. Moving the cursor or typing yourself in the middle of
-an unlocked phrase fights the correction, because the script can only delete
-the characters it just inserted.
+again, or press Escape, to stop. The clip is saved as a wav file, Phonon-2
+transcribes that file, and the transcript is pasted where the cursor is.
+The same text stays on the clipboard. Ctrl-C quits.
 """
 
 from __future__ import annotations
@@ -20,14 +16,22 @@ import subprocess
 import sys
 import threading
 import time
+import wave
+from pathlib import Path
 
-DELETE_KEYCODE = 0x33
 ESCAPE_KEYCODE = 0x35
+V_KEYCODE = 0x09
+COMMAND_KEYCODE = 0x37
+COMMAND_FLAG = 0x00100000
 HID_SOURCE = 1
-HID_TAP = 0
+HID_POST = 0
 KEY_DOWN = 10
 KEY_UP = 11
 FLAGS_CHANGED = 12
+CLIP_PATH = Path.home() / ".cache" / "dictate" / "last.wav"
+SAMPLE_RATE = 16_000
+MIN_CLIP_S = 0.25
+SILENCE_RMS = 0.004
 ALT_FLAG = 0x00080000
 # Letters cancel a half-finished double-tap. These modifiers do not.
 MODIFIER_KEYS = frozenset({
@@ -87,116 +91,76 @@ def _use_fermion_python() -> None:
     os.execv(target, [target, *sys.argv])
 
 
-def revision(old: str, new: str) -> tuple[int, str]:
-    """How to turn the text already inserted into the new guess.
+def pcm16(samples) -> bytes:
+    """Mono float samples in [-1, 1], as little-endian 16-bit PCM."""
+    try:
+        import numpy as np
+        audio = np.clip(np.asarray(samples, dtype="float64"), -1.0, 1.0)
+        return (audio * 32767.0).astype("<i2").tobytes()
+    except ModuleNotFoundError:
+        pass
+    import array
+    out = array.array("h")
+    for sample in samples:
+        value = float(sample)
+        if value > 1.0:
+            value = 1.0
+        elif value < -1.0:
+            value = -1.0
+        out.append(int(round(value * 32767.0)))
+    if sys.byteorder != "little":
+        out.byteswap()
+    return out.tobytes()
 
-    Returns the number of characters to delete and the suffix to insert.
-    The shared prefix stays, so a growing sentence does not retype itself.
-    """
-    limit = min(len(old), len(new))
-    kept = 0
-    while kept < limit and old[kept] == new[kept]:
-        kept += 1
-    return len(old) - kept, new[kept:]
+
+def write_wav(path: Path, samples, rate: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(pcm16(samples))
 
 
-def _core(word: str) -> str:
-    return word.strip(".,!?;:\"'“”").casefold()
-
-
-def _common_cores(old: list[str], new: list[str]) -> int:
+def clip_level(samples) -> float:
+    try:
+        import numpy as np
+        audio = np.asarray(samples, dtype="float64")
+        if int(audio.size) == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(audio))))
+    except ModuleNotFoundError:
+        pass
+    total = 0.0
     count = 0
-    for left, right in zip(old, new):
-        if _core(left) != _core(right):
-            break
+    for sample in samples:
+        value = float(sample)
+        total += value * value
         count += 1
-    return count
+    if count == 0:
+        return 0.0
+    return (total / count) ** 0.5
 
 
-class Typer:
-    """Type a guess only after it has settled.
-
-    The first glimpse is kept and not typed. Later glimpses type the words
-    that stayed the same, except the last word, which is still being spoken.
-    A finished phrase then adds that last word. Words already on screen are
-    not deleted just because the next guess capitalizes them.
-    """
-
-    def __init__(self, keyboard):
-        self.keyboard = keyboard
-        self.shown: list[str] = []
-        self.prev: list[str] | None = None
-
-    def reset(self) -> None:
-        self.shown = []
-        self.prev = None
-
-    def partial(self, text: str) -> None:
-        words = text.split()
-        if not words:
-            return
-        if self.prev is None:
-            self.prev = words
-            return
-        common = _common_cores(self.prev, words)
-        if not text.rstrip().endswith((".", "?", "!")) and common == len(words):
-            common -= 1
-        if common > 0:
-            self._append(words[:common])
-        self.prev = words
-
-    def final(self, text: str) -> None:
-        self._commit_rest(text.split())
-        if self.shown:
-            self.keyboard.insert(" ")
-        self.reset()
-
-    def flush(self) -> None:
-        """Commit the latest guess, including the word still being held."""
-        if self.prev:
-            self._commit_rest(self.prev)
-        if self.shown:
-            self.keyboard.insert(" ")
-        self.reset()
-
-    def _append(self, words: list[str]) -> None:
-        """Add words past what is shown. A partial never deletes."""
-        if len(words) <= len(self.shown):
-            return
-        if _common_cores(self.shown, words) < len(self.shown):
-            return
-        extra = words[len(self.shown):]
-        piece = (" " if self.shown else "") + " ".join(extra)
-        self.keyboard.insert(piece)
-        self.shown.extend(extra)
-
-    def _commit_rest(self, words: list[str]) -> None:
-        if not words:
-            return
-        match = _common_cores(self.shown, words)
-        if match < len(self.shown):
-            start = match
-        elif self.shown and self.shown[-1] != words[len(self.shown) - 1]:
-            start = len(self.shown) - 1
-        else:
-            start = len(self.shown)
-        self._replace_from(start, words)
-
-    def _replace_from(self, start: int, words: list[str]) -> None:
-        if start < len(self.shown):
-            tail = " ".join(self.shown[start:])
-            if start > 0:
-                tail = " " + tail
-            self.keyboard.backspace(len(tail))
-        extra = words[start:]
-        if extra:
-            piece = (" " if start > 0 else "") + " ".join(extra)
-            self.keyboard.insert(piece)
-        self.shown = list(words)
+def worth_transcribing(samples, rate: int) -> bool:
+    count = int(getattr(samples, "size", len(samples)))
+    if count < int(MIN_CLIP_S * rate):
+        return False
+    return clip_level(samples) >= SILENCE_RMS
 
 
-class Keyboard:
-    """Post keystrokes through CoreGraphics. Needs Accessibility permission."""
+def copy_text(text: str) -> None:
+    subprocess.run(
+        ["/usr/bin/pbcopy"],
+        input=text.encode("utf-8"),
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+class Paster:
+    """Press Command-V in the focused app. Needs Accessibility permission."""
 
     def __init__(self):
         self._cg = ctypes.cdll.LoadLibrary(
@@ -211,11 +175,12 @@ class Keyboard:
         cg.CGEventCreateKeyboardEvent.argtypes = [
             ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
         cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
-        cg.CGEventKeyboardSetUnicodeString.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
-        cg.CGEventKeyboardGetUnicodeString.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
-            ctypes.c_void_p]
+        cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        cg.CGEventGetFlags.argtypes = [ctypes.c_void_p]
+        cg.CGEventGetFlags.restype = ctypes.c_uint64
+        cg.CGEventGetIntegerValueField.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32]
+        cg.CGEventGetIntegerValueField.restype = ctypes.c_int64
         cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
         cf.CFRelease.argtypes = [ctypes.c_void_p]
         self._app.AXIsProcessTrusted.restype = ctypes.c_bool
@@ -223,39 +188,45 @@ class Keyboard:
     def trusted(self) -> bool:
         return bool(self._app.AXIsProcessTrusted())
 
-    def insert(self, text: str) -> None:
-        if not text:
-            return
-        encoded = text.encode("utf-16-le")
-        count = len(encoded) // 2
-        buf = (ctypes.c_uint16 * count).from_buffer_copy(encoded)
-        self._post(0, ctypes.cast(buf, ctypes.c_void_p), count)
+    def command_v_event(self, source, down: bool):
+        event = self._cg.CGEventCreateKeyboardEvent(source, V_KEYCODE, down)
+        if not event:
+            raise SystemExit("could not create a paste keystroke")
+        self._cg.CGEventSetFlags(event, COMMAND_FLAG)
+        return event
 
-    def backspace(self, count: int) -> None:
-        for _ in range(count):
-            self._post(DELETE_KEYCODE, None, 0)
-
-    def _post(self, keycode: int, utf16, count: int) -> None:
+    def paste(self) -> None:
+        if not self.trusted():
+            raise PermissionError("accessibility")
         source = self._cg.CGEventSourceCreate(HID_SOURCE)
         if not source:
             raise SystemExit("could not create a keyboard event source")
+        cg, cf = self._cg, self._cf
         try:
-            for down in (True, False):
-                event = self._cg.CGEventCreateKeyboardEvent(source, keycode, down)
+            chord = (
+                (COMMAND_KEYCODE, True, COMMAND_FLAG),
+                (V_KEYCODE, True, COMMAND_FLAG),
+                (V_KEYCODE, False, COMMAND_FLAG),
+                (COMMAND_KEYCODE, False, 0),
+            )
+            for keycode, down, flags in chord:
+                event = cg.CGEventCreateKeyboardEvent(source, keycode, down)
                 if not event:
-                    raise SystemExit("could not create a keyboard event")
-                if utf16 is not None:
-                    self._cg.CGEventKeyboardSetUnicodeString(event, count, utf16)
-                self._cg.CGEventPost(HID_TAP, event)
-                self._cf.CFRelease(event)
+                    raise SystemExit("could not create a paste keystroke")
+                cg.CGEventSetFlags(event, flags)
+                cg.CGEventPost(HID_POST, event)
+                cf.CFRelease(event)
+                if keycode == V_KEYCODE and down:
+                    time.sleep(0.02)
         finally:
-            self._cf.CFRelease(source)
+            cf.CFRelease(source)
 
 
-def _announce(text: str) -> None:
+def _announce(text: str, sound: str | None = None) -> None:
     print(text, file=sys.stderr, flush=True)
-    name = "Tink.aiff" if text.startswith("on") else "Pop.aiff"
-    path = f"/System/Library/Sounds/{name}"
+    if not sound:
+        return
+    path = f"/System/Library/Sounds/{sound}"
     if os.path.isfile(path):
         subprocess.Popen(
             ["/usr/bin/afplay", path],
@@ -395,11 +366,12 @@ class HotkeyTap:
 
 
 class Dictation:
-    """One microphone session at a time. Closed again as soon as it stops."""
+    """One clip at a time. The microphone closes as soon as the take stops."""
 
-    def __init__(self, speech, keyboard):
+    def __init__(self, speech, paster: Paster, clip_path: Path = CLIP_PATH):
         self.speech = speech
-        self.typer = Typer(keyboard)
+        self.paster = paster
+        self.clip_path = clip_path
         self.stop_mic = threading.Event()
         self.thread: threading.Thread | None = None
         self.on = False
@@ -408,59 +380,85 @@ class Dictation:
     def toggle(self) -> None:
         with self._lock:
             if self.on:
-                self.on = False
-                self.stop_mic.set()
-                _announce("off")
+                self._request_stop()
                 return
             if self.thread is not None and self.thread.is_alive():
+                _announce("still transcribing the last clip")
                 return
             self.on = True
             self.stop_mic.clear()
-            self.typer.reset()
             self.thread = threading.Thread(
-                target=self._listen, name="dictate-mic", daemon=True)
+                target=self._record, name="dictate-mic", daemon=True)
             self.thread.start()
-        _announce("on — speak")
+        _announce("recording", "Tink.aiff")
 
     def stop(self) -> None:
         with self._lock:
-            if not self.on:
-                return
-            self.on = False
-            self.stop_mic.set()
-        _announce("off")
+            self._request_stop()
 
-    def _listen(self) -> None:
-        from fermion._speech import live
+    def _request_stop(self) -> None:
+        if not self.on:
+            return
+        self.on = False
+        self.stop_mic.set()
+        _announce("recording stopped")
 
-        live.SILENCE_CLOSE_S = 1.5
+    def _record(self) -> None:
         me = threading.current_thread()
-        session = live.LiveSession(
-            self.speech, on_partial=self._partial, on_final=self._final)
+        audio = None
         try:
-            _run_mic_until(session, self.stop_mic)
+            audio = _capture(self.stop_mic)
         except Exception as exc:
             print(f"microphone stopped ({exc}).", file=sys.stderr, flush=True)
         finally:
             with self._lock:
                 if self.thread is me:
                     self.on = False
-
-    def _partial(self, text: str) -> None:
-        if self.stop_mic.is_set():
+        if audio is None:
             return
-        self.typer.partial(text)
+        if not worth_transcribing(audio, SAMPLE_RATE):
+            _announce("nothing caught on the microphone")
+            return
+        seconds = int(audio.size) / SAMPLE_RATE
+        try:
+            write_wav(self.clip_path, audio, SAMPLE_RATE)
+        except Exception as exc:
+            print(f"could not save the clip ({exc}).", file=sys.stderr, flush=True)
+            return
+        _announce(f"transcribing {seconds:.1f}s from {self.clip_path}")
+        try:
+            text, _decode_s, _audio_s = self.speech.transcribe(self.clip_path)
+        except Exception as exc:
+            print(f"transcription failed ({exc}).", file=sys.stderr, flush=True)
+            return
+        text = str(text).strip()
+        if not text:
+            _announce("no words in that clip")
+            return
+        try:
+            copy_text(text)
+        except Exception as exc:
+            print(text, file=sys.stderr, flush=True)
+            print(f"could not copy to the clipboard ({exc}).", file=sys.stderr, flush=True)
+            return
+        time.sleep(0.05)
+        try:
+            self.paster.paste()
+        except Exception as exc:
+            print(text, file=sys.stderr, flush=True)
+            print(
+                f"could not paste ({exc}). The text is on the clipboard.",
+                file=sys.stderr, flush=True)
+            return
+        _announce(text, "Pop.aiff")
 
-    def _final(self, text: str) -> None:
-        self.typer.final(text)
 
-
-def _run_mic_until(session, stop_mic: threading.Event) -> None:
+def _capture(stop_mic: threading.Event):
+    """Record until stop_mic. None means the microphone could not be opened."""
     import queue
 
+    import numpy as np
     import sounddevice as sd
-    from fermion._speech.engine import SAMPLE_RATE
-    from fermion._speech.live import BLOCK_S
 
     blocks: "queue.Queue" = queue.Queue()
 
@@ -470,7 +468,7 @@ def _run_mic_until(session, stop_mic: threading.Event) -> None:
     try:
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            blocksize=int(BLOCK_S * SAMPLE_RATE), callback=_on_audio)
+            blocksize=int(0.05 * SAMPLE_RATE), callback=_on_audio)
         stream.start()
     except Exception as exc:
         print(
@@ -478,22 +476,25 @@ def _run_mic_until(session, stop_mic: threading.Event) -> None:
             "microphone access in System Settings → Privacy & Security → "
             "Microphone, then double-tap Option again.",
             file=sys.stderr, flush=True)
-        return
+        return None
+    chunks = []
     try:
         while not stop_mic.is_set():
             try:
-                session.feed(blocks.get(timeout=0.25))
+                chunks.append(blocks.get(timeout=0.25))
             except queue.Empty:
                 continue
-            while not stop_mic.is_set():
-                try:
-                    session.feed(blocks.get_nowait())
-                except queue.Empty:
-                    break
     finally:
         stream.stop()
         stream.close()
-    session.finish()
+    while True:
+        try:
+            chunks.append(blocks.get_nowait())
+        except queue.Empty:
+            break
+    if not chunks:
+        return np.zeros(0, dtype="float32")
+    return np.concatenate(chunks)
 
 
 def load_model(model: str):
@@ -511,22 +512,19 @@ def load_model(model: str):
 
 
 def serve(model: str) -> None:
-    from fermion._speech import gate, live
+    from fermion._speech import gate
 
-    keyboard = Keyboard()
-    if not keyboard.trusted():
+    paster = Paster()
+    if not paster.trusted():
         raise SystemExit(
-            "this terminal cannot type into other apps yet.\n"
+            "this terminal cannot paste into other apps yet.\n"
             "System Settings → Privacy & Security → Accessibility, enable the "
             "app you launched this from (Terminal, iTerm, or Grok), then run it again.\n"
             f"interpreter: {sys.executable}")
     gate.require_listen("`dictate`")
     print("loading Phonon-2 on this Mac…", file=sys.stderr, flush=True)
     speech = load_model(model)
-    # A pause of 0.7 s used to end the phrase. The finished decode then
-    # replaced the line, which reads as the sentence starting over.
-    live.SILENCE_CLOSE_S = 1.5
-    dictation = Dictation(speech, keyboard)
+    dictation = Dictation(speech, paster)
     # The tap has to be pumped on this thread. A background run loop was
     # created successfully before and never saw the double-tap.
     hotkeys = HotkeyTap(dictation.toggle, dictation.stop)
@@ -537,23 +535,13 @@ def serve(model: str) -> None:
             "the app you launched this from (Terminal, iTerm, or Grok), "
             "then run it again.")
     print("ready. The microphone is off.", file=sys.stderr, flush=True)
-    print("Double-tap Option to dictate. Double-tap again, or press Escape, to stop.",
+    print("Double-tap Option to record. Double-tap again, or press Escape, to stop.",
+          file=sys.stderr, flush=True)
+    print("The transcript is pasted at the cursor and left on the clipboard.",
           file=sys.stderr, flush=True)
     print("Ctrl-C quits.", file=sys.stderr, flush=True)
     while True:
         hotkeys.pump(0.25)
-
-
-class _Rec:
-    def __init__(self):
-        self.text = ""
-
-    def insert(self, text: str) -> None:
-        self.text += text
-
-    def backspace(self, count: int) -> None:
-        if count:
-            self.text = self.text[:-count]
 
 
 def _check_tap_run_loop(hotkeys: HotkeyTap) -> None:
@@ -597,9 +585,21 @@ def _press_option(gesture: OptionDoubleTap, keycode: int, t_down: float, t_up: f
 
 
 def _check() -> None:
-    assert revision("", "Hello") == (0, "Hello")
-    assert revision("Hello", "Hello there") == (0, " there")
-    assert revision("hell is", "what is") == (7, "what is")
+    import tempfile
+
+    assert pcm16([0.0, 1.0, -1.0]) == b"\x00\x00\xff\x7f\x01\x80"
+    assert not worth_transcribing([0.0] * 100, SAMPLE_RATE)
+    assert not worth_transcribing([0.0] * SAMPLE_RATE, SAMPLE_RATE)
+    assert worth_transcribing([0.05] * SAMPLE_RATE, SAMPLE_RATE)
+    clip = Path(tempfile.mkdtemp()) / "clip.wav"
+    payload = pcm16([0.0, 1.0, -1.0])
+    write_wav(clip, [0.0, 1.0, -1.0], SAMPLE_RATE)
+    with wave.open(str(clip)) as handle:
+        assert handle.getnchannels() == 1
+        assert handle.getsampwidth() == 2
+        assert handle.getframerate() == SAMPLE_RATE
+        assert handle.getnframes() == 3
+        assert handle.readframes(3) == payload
 
     toggles: list[int] = []
     gesture = OptionDoubleTap(lambda: toggles.append(1))
@@ -624,41 +624,24 @@ def _check() -> None:
     _press_option(gesture, 0x3D, 8.25, 8.35)
     assert toggles == [1, 1, 1]
 
-    keyboard = Keyboard()
-    source = keyboard._cg.CGEventSourceCreate(HID_SOURCE)
-    event = keyboard._cg.CGEventCreateKeyboardEvent(source, 0, True)
+    paster = Paster()
+    source = paster._cg.CGEventSourceCreate(HID_SOURCE)
+    event = paster.command_v_event(source, True)
     if not source or not event:
-        raise SystemExit("CoreGraphics did not create a keyboard event")
-    sample = "Hello"
-    raw = sample.encode("utf-16-le")
-    buf = (ctypes.c_uint16 * len(sample)).from_buffer_copy(raw)
-    keyboard._cg.CGEventKeyboardSetUnicodeString(
-        event, len(sample), ctypes.cast(buf, ctypes.c_void_p))
-    got_n = ctypes.c_ulong()
-    got = (ctypes.c_uint16 * len(sample))()
-    keyboard._cg.CGEventKeyboardGetUnicodeString(
-        event, len(sample), ctypes.byref(got_n), ctypes.cast(got, ctypes.c_void_p))
-    read = bytes(got).decode("utf-16-le")
-    keyboard._cf.CFRelease(event)
-    keyboard._cf.CFRelease(source)
-    if got_n.value != len(sample) or read != sample:
-        raise SystemExit(f"keyboard event returned {read!r}, expected {sample!r}")
-    steady = _Rec()
-    typer = Typer(steady)
-    typer.partial("it is working")
-    assert steady.text == ""
-    typer.partial("it is working now")
-    assert steady.text == "it is working"
-    typer.partial("this is working now please")
-    assert steady.text == "it is working"
-    typer.final("It is working now.")
-    assert steady.text == "it is working now. "
+        raise SystemExit("CoreGraphics did not create a paste keystroke")
+    keycode = int(paster._cg.CGEventGetIntegerValueField(event, 9))
+    flags = int(paster._cg.CGEventGetFlags(event))
+    paster._cf.CFRelease(event)
+    paster._cf.CFRelease(source)
+    if keycode != V_KEYCODE or flags & COMMAND_FLAG != COMMAND_FLAG:
+        raise SystemExit(
+            f"paste keystroke was key {keycode} flags {flags:#x}")
+
     hotkeys = HotkeyTap(lambda: None, lambda: None)
     if not hotkeys.start():
         raise SystemExit("hotkey tap was not created; Input Monitoring is missing")
     _check_tap_run_loop(hotkeys)
-    print("double-tap, steady typing, hotkey tap: ok")
-    print("accessibility:", "granted" if keyboard.trusted() else "not granted")
+    print("clip, paste keystroke, double-tap, hotkey tap: ok")
 
 
 def main(argv: list[str]) -> int:
