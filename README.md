@@ -4,11 +4,32 @@ A personal Mac script for local dictation. Double-tap Option to record. Double-t
 
 This is not a Fermion Research product. It only calls their installed tools. The repository does not include their code or the model weights.
 
-## Run
+## Install
+
+The speech stack goes into a virtual environment in this folder. Python 3.11 is the version this was set up with.
 
 ```bash
-python3 dictate.py
+python3.11 -m venv .venv
+.venv/bin/pip install fermion-research
+.venv/bin/pip install mlx mlx-audio mlx-lm soundfile sounddevice scipy zstandard
 ```
+
+## Run
+
+With [just](https://github.com/casey/just) or make:
+
+```bash
+just dictate
+make dictate
+```
+
+Both run the same thing, which also works on its own:
+
+```bash
+.venv/bin/python dictate.py
+```
+
+Wait for `ready. The microphone is off.` before the first double-tap. The first launch downloads the Phonon-2 weights.
 
 macOS has to allow the app you launch it from (Terminal, iTerm, or similar) under Privacy & Security:
 
@@ -17,13 +38,6 @@ macOS has to allow the app you launch it from (Terminal, iTerm, or similar) unde
 - Microphone, so the clip can be recorded
 
 The last recording is kept at `~/.cache/dictate/last.wav`.
-
-Install the speech stack yourself:
-
-```bash
-pip install fermion-research
-pip install mlx mlx-audio mlx-lm soundfile scipy zstandard
-```
 
 ## Their licenses
 
