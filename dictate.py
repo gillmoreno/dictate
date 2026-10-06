@@ -3,13 +3,14 @@
 
 The microphone stays closed until you double-tap Option. Double-tap Option
 again, or press Escape, to stop. The clip is saved as a wav file, Phonon-2
-transcribes that file, and the transcript is pasted where the cursor is.
-The same text stays on the clipboard. Ctrl-C quits.
+transcribes that file on the Neural Engine, and the transcript is pasted
+where the cursor is. The same text stays on the clipboard. Ctrl-C quits.
 """
 
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import shutil
 import subprocess
@@ -29,6 +30,11 @@ KEY_DOWN = 10
 KEY_UP = 11
 FLAGS_CHANGED = 12
 CLIP_PATH = Path.home() / ".cache" / "dictate" / "last.wav"
+ROOT = Path(__file__).resolve().parent
+ENGINE_DIR = ROOT / "engine"
+ENGINE_BIN = ENGINE_DIR / ".build" / "release" / "dictate-engine"
+MODEL_DIR = Path.home() / ".cache" / "dictate" / "Phonon-2-CoreML"
+MODEL_REPO = "FermionResearch/Phonon-2-CoreML"
 SAMPLE_RATE = 16_000
 MIN_CLIP_S = 0.25
 SILENCE_RMS = 0.004
@@ -40,55 +46,6 @@ MODIFIER_KEYS = frozenset({
 TAP_DISABLED = (0xFFFFFFFE, 0xFFFFFFFF)
 MAX_HOLD_S = 0.50
 DOUBLE_TAP_S = 0.60
-
-
-def _fermion_python() -> str | None:
-    """The interpreter that has the fermion package, if it is not this one."""
-    candidates: list[str] = []
-    binary = shutil.which("fermion")
-    if binary:
-        try:
-            shebang = open(binary).readline().strip()
-        except OSError:
-            shebang = ""
-        if shebang.startswith("#!"):
-            candidates.append(shebang[2:].strip().split()[0])
-    candidates.extend([
-        "/usr/local/bin/python3.11",
-        "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11",
-    ])
-    mine = os.path.realpath(sys.executable)
-    seen: set[str] = set()
-    for path in candidates:
-        if not path or not os.path.isfile(path):
-            continue
-        real = os.path.realpath(path)
-        if real in seen or real == mine:
-            continue
-        seen.add(real)
-        return path
-    return None
-
-
-def _use_fermion_python() -> None:
-    """Re-run under the Python that has Phonon when `python3` is another one."""
-    try:
-        import fermion  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        pass
-    if os.environ.get("DICTATE_FERMION_PY") == "1":
-        raise SystemExit(
-            "Phonon is not installed for this Python.\n"
-            "The copy that works is: /usr/local/bin/python3.11 "
-            "~/Desktop/utils/dictate/dictate.py")
-    target = _fermion_python()
-    if target is None:
-        raise SystemExit(
-            "Phonon is not installed for this Python, and `fermion` is not on PATH.\n"
-            "The interpreter from `fermion listen` is /usr/local/bin/python3.11.")
-    os.environ["DICTATE_FERMION_PY"] = "1"
-    os.execv(target, [target, *sys.argv])
 
 
 def pcm16(samples) -> bytes:
@@ -497,23 +454,136 @@ def _capture(stop_mic: threading.Event):
     return np.concatenate(chunks)
 
 
-def load_model(model: str):
-    from fermion._speech import backends, fetch, live
-    from fermion.transcribe import _resolve
-
-    repo, key, pin, local_dir = _resolve(model)
-    model_dir = local_dir if local_dir is not None else fetch.ensure(repo, key, pin)
-    speech = backends.load(
-        "mlx", model_dir, profile=key, backend=pin["backend"], quiet=True)
-    print("warming the model (first launch in a while compiles shaders)…",
-          file=sys.stderr, flush=True)
-    live.warm_up(speech)
-    return speech
+def _model_ready(path: Path) -> bool:
+    weights = path / "Phonon-2.mlpackage" / "Data" / "com.apple.CoreML" / "weights" / "weight.bin"
+    return (
+        (path / "manifest.json").is_file()
+        and (path / "decoder.bin").is_file()
+        and weights.is_file()
+    )
 
 
-def serve(model: str) -> None:
-    from fermion._speech import gate
+def ensure_model() -> Path:
+    """The Core ML folder, downloaded once into the user cache."""
+    if _model_ready(MODEL_DIR):
+        return MODEL_DIR
+    print(
+        "downloading Phonon-2 for the Neural Engine (about 350 MB)…",
+        file=sys.stderr, flush=True)
+    try:
+        from huggingface_hub import snapshot_download
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "huggingface_hub is not installed for this Python.\n"
+            "pip install huggingface_hub")
+    snapshot_download(
+        MODEL_REPO,
+        local_dir=str(MODEL_DIR),
+        allow_patterns=[
+            "manifest.json",
+            "decoder.bin",
+            "NOTICE",
+            "Phonon-2.mlpackage/**",
+            "ci/**",
+        ],
+    )
+    if not _model_ready(MODEL_DIR):
+        raise SystemExit(
+            f"the download finished, but {MODEL_DIR} is not a complete model.")
+    return MODEL_DIR
 
+
+def ensure_engine() -> Path:
+    """The release binary. Built once, from the Swift package in this folder."""
+    if ENGINE_BIN.is_file():
+        return ENGINE_BIN
+    if not (ENGINE_DIR / "Package.swift").is_file():
+        raise SystemExit(f"the Neural Engine runner is missing at {ENGINE_DIR}")
+    if shutil.which("swift") is None:
+        raise SystemExit(
+            "swift is not installed.\n"
+            "Install the Xcode Command Line Tools, then run this again.")
+    print("building the Neural Engine runner (once)…", file=sys.stderr, flush=True)
+    subprocess.run(
+        ["swift", "build", "-c", "release", "--package-path", str(ENGINE_DIR)],
+        check=True,
+    )
+    if not ENGINE_BIN.is_file():
+        raise SystemExit("swift build finished without producing dictate-engine")
+    return ENGINE_BIN
+
+
+class CoreMLSpeech:
+    """Phonon-2 kept loaded. The encoder stays on the Neural Engine."""
+
+    def __init__(self):
+        # The build and the download do not depend on each other.
+        errors: list[BaseException] = []
+
+        def _download() -> None:
+            try:
+                ensure_model()
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=_download, name="dictate-model")
+        thread.start()
+        try:
+            binary = ensure_engine()
+        finally:
+            thread.join()
+        if errors:
+            raise errors[0]
+        bundle = MODEL_DIR
+        self.proc = subprocess.Popen(
+            [str(binary), str(bundle)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert self.proc.stdout is not None
+        line = self.proc.stdout.readline()
+        if not line:
+            raise SystemExit("the Neural Engine runner stopped before it was ready.")
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"the Neural Engine runner sent {line!r} ({exc}).")
+        if not message.get("ready"):
+            raise SystemExit(f"the Neural Engine runner did not start: {message}")
+
+    def transcribe(self, path: Path):
+        if self.proc.poll() is not None:
+            raise RuntimeError("the Neural Engine runner has stopped")
+        assert self.proc.stdin is not None and self.proc.stdout is not None
+        self.proc.stdin.write(f"{path}\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError("the Neural Engine runner closed its output")
+        message = json.loads(line)
+        if message.get("error"):
+            raise RuntimeError(str(message["error"]))
+        return (
+            str(message.get("text", "")),
+            float(message.get("wall_s", 0.0)),
+            float(message.get("audio_s", 0.0)),
+        )
+
+    def close(self) -> None:
+        if self.proc.poll() is not None:
+            return
+        try:
+            assert self.proc.stdin is not None
+            self.proc.stdin.write("quit\n")
+            self.proc.stdin.flush()
+            self.proc.wait(timeout=2)
+        except Exception:
+            self.proc.terminate()
+
+
+def serve() -> None:
     paster = Paster()
     if not paster.trusted():
         raise SystemExit(
@@ -521,9 +591,8 @@ def serve(model: str) -> None:
             "System Settings → Privacy & Security → Accessibility, enable the "
             "app you launched this from (Terminal, iTerm, or Grok), then run it again.\n"
             f"interpreter: {sys.executable}")
-    gate.require_listen("`dictate`")
-    print("loading Phonon-2 on this Mac…", file=sys.stderr, flush=True)
-    speech = load_model(model)
+    print("loading Phonon-2 on the Neural Engine…", file=sys.stderr, flush=True)
+    speech = CoreMLSpeech()
     dictation = Dictation(speech, paster)
     # The tap has to be pumped on this thread. A background run loop was
     # created successfully before and never saw the double-tap.
@@ -540,8 +609,11 @@ def serve(model: str) -> None:
     print("The transcript is pasted at the cursor and left on the clipboard.",
           file=sys.stderr, flush=True)
     print("Ctrl-C quits.", file=sys.stderr, flush=True)
-    while True:
-        hotkeys.pump(0.25)
+    try:
+        while True:
+            hotkeys.pump(0.25)
+    finally:
+        speech.close()
 
 
 def _check_tap_run_loop(hotkeys: HotkeyTap) -> None:
@@ -648,9 +720,11 @@ def main(argv: list[str]) -> int:
     if len(argv) > 1 and argv[1] == "--check":
         _check()
         return 0
-    _use_fermion_python()
-    model = argv[1] if len(argv) > 1 else "phonon-2"
-    serve(model)
+    if len(argv) > 1 and argv[1] not in ("phonon-2", "phonon2"):
+        raise SystemExit(
+            "this app runs Phonon-2 on the Neural Engine.\n"
+            f"unknown model: {argv[1]}")
+    serve()
     return 0
 
 
