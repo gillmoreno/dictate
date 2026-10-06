@@ -583,7 +583,61 @@ class CoreMLSpeech:
             self.proc.terminate()
 
 
+def _mic_python() -> str | None:
+    """An interpreter that can open the microphone, if this one cannot."""
+    candidates: list[str] = []
+    found = shutil.which("python3.11")
+    if found:
+        candidates.append(found)
+    candidates.extend([
+        "/usr/local/bin/python3.11",
+        "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11",
+    ])
+    mine = os.path.realpath(sys.executable)
+    seen: set[str] = set()
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        real = os.path.realpath(path)
+        if real in seen or real == mine:
+            continue
+        seen.add(real)
+        probe = subprocess.run(
+            [path, "-c", "import sounddevice, numpy"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0:
+            return path
+    return None
+
+
+def _use_mic_python() -> None:
+    """Re-run under a Python that has sounddevice.
+
+    `python3` is often Homebrew 3.14, which cannot record. Python 3.11 can.
+    """
+    try:
+        import sounddevice  # noqa: F401
+        import numpy  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+    if os.environ.get("DICTATE_MIC_PY") == "1":
+        raise SystemExit(
+            "this Python cannot record from the microphone.\n"
+            f"{sys.executable} -m pip install sounddevice numpy")
+    target = _mic_python()
+    if target is None:
+        raise SystemExit(
+            "this Python cannot record from the microphone.\n"
+            f"{sys.executable} -m pip install sounddevice numpy")
+    os.environ["DICTATE_MIC_PY"] = "1"
+    os.execv(target, [target, *sys.argv])
+
+
 def serve() -> None:
+    _use_mic_python()
     paster = Paster()
     if not paster.trusted():
         raise SystemExit(
