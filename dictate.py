@@ -32,7 +32,10 @@ FLAGS_CHANGED = 12
 CLIP_PATH = Path.home() / ".cache" / "dictate" / "last.wav"
 ROOT = Path(__file__).resolve().parent
 ENGINE_DIR = ROOT / "engine"
-ENGINE_BIN = ENGINE_DIR / ".build" / "release" / "dictate-engine"
+# SwiftPM's build database fails with "disk I/O error" under ~/Desktop,
+# so the runner is built in the cache instead of next to the package.
+ENGINE_BUILD = Path.home() / ".cache" / "dictate" / "engine-build"
+ENGINE_BIN = ENGINE_BUILD / "release" / "dictate-engine"
 MODEL_DIR = Path.home() / ".cache" / "dictate" / "Phonon-2-CoreML"
 MODEL_REPO = "FermionResearch/Phonon-2-CoreML"
 SAMPLE_RATE = 16_000
@@ -505,7 +508,8 @@ def ensure_engine() -> Path:
             "Install the Xcode Command Line Tools, then run this again.")
     print("building the Neural Engine runner (once)…", file=sys.stderr, flush=True)
     subprocess.run(
-        ["swift", "build", "-c", "release", "--package-path", str(ENGINE_DIR)],
+        ["swift", "build", "-c", "release", "--package-path", str(ENGINE_DIR),
+         "--scratch-path", str(ENGINE_BUILD)],
         check=True,
     )
     if not ENGINE_BIN.is_file():

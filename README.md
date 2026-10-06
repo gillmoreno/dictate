@@ -38,7 +38,7 @@ macOS has to allow the app you launch it from (Terminal, iTerm, or similar) unde
 - Accessibility, so the transcript can be pasted
 - Microphone, so the clip can be recorded
 
-The last recording is kept at `~/.cache/dictate/last.wav`. The model folder is `~/.cache/dictate/Phonon-2-CoreML`.
+The last recording is kept at `~/.cache/dictate/last.wav`. The model folder is `~/.cache/dictate/Phonon-2-CoreML`, and the Neural Engine runner is built in `~/.cache/dictate/engine-build`.
 
 ## Their licenses
 
