@@ -32,6 +32,8 @@ Both run the same thing, which also works on its own:
 
 Wait for `ready. The microphone is off.` before the first double-tap. The first launch downloads the Phonon-2 Core ML weights (about 350 MB) and prepares them for this Mac's Neural Engine. That preparation can take several minutes. Later launches load in a few seconds. The model stays in its own process, off the GPU.
 
+A Sennheiser microphone is used whenever one is connected. Otherwise the system default input records. Edit `PREFERRED_INPUTS` in `dictate.py` to prefer another microphone. A take that is too quiet is reported with its measured level and the threshold it needed.
+
 macOS has to allow the app you launch it from (Terminal, iTerm, or similar) under Privacy & Security:
 
 - Input Monitoring, so the Option double-tap is seen

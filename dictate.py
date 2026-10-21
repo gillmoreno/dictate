@@ -39,6 +39,9 @@ ENGINE_BIN = ENGINE_BUILD / "release" / "dictate-engine"
 MODEL_DIR = Path.home() / ".cache" / "dictate" / "Phonon-2-CoreML"
 MODEL_REPO = "FermionResearch/Phonon-2-CoreML"
 SAMPLE_RATE = 16_000
+# The first connected input whose name contains one of these is used.
+# With none connected, the system default input records.
+PREFERRED_INPUTS = ("Sennheiser",)
 MIN_CLIP_S = 0.25
 SILENCE_RMS = 0.004
 ALT_FLAG = 0x00080000
@@ -377,7 +380,10 @@ class Dictation:
         if audio is None:
             return
         if not worth_transcribing(audio, SAMPLE_RATE):
-            _announce("nothing caught on the microphone")
+            _announce(
+                f"nothing caught on the microphone "
+                f"({int(audio.size) / SAMPLE_RATE:.2f}s, level "
+                f"{clip_level(audio):.4f}, needs {SILENCE_RMS:.4f})")
             return
         seconds = int(audio.size) / SAMPLE_RATE
         try:
@@ -413,6 +419,19 @@ class Dictation:
         _announce(text, "Pop.aiff")
 
 
+def _input_device(sd):
+    """A preferred microphone's index when one is connected, else None."""
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    for wanted in PREFERRED_INPUTS:
+        for index, device in enumerate(devices):
+            if device["max_input_channels"] > 0 and wanted.lower() in device["name"].lower():
+                return index
+    return None
+
+
 def _capture(stop_mic: threading.Event):
     """Record until stop_mic. None means the microphone could not be opened."""
     import queue
@@ -427,9 +446,15 @@ def _capture(stop_mic: threading.Event):
 
     try:
         stream = sd.InputStream(
+            device=_input_device(sd),
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             blocksize=int(0.05 * SAMPLE_RATE), callback=_on_audio)
         stream.start()
+        try:
+            name = sd.query_devices(stream.device)["name"]
+        except Exception:
+            name = f"device {stream.device}"
+        print(f"listening on {name}", file=sys.stderr, flush=True)
     except Exception as exc:
         print(
             f"could not open the microphone ({exc}). Grant this terminal "
